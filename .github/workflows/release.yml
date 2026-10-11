@@ -2,7 +2,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "samsung-v*"
   workflow_dispatch:
 
 jobs:
