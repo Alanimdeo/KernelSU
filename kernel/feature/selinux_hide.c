@@ -94,7 +94,7 @@ static write_op_fn callthru_context_write, callthru_access_write;
 #define ksu_task_security_struct cred_security_struct
 #endif
 
-static ssize_t my_write_context(struct file *file, char *buf, size_t size)
+static ssize_t __nocfi my_write_context(struct file *file, char *buf, size_t size)
 {
     // apply to all app uids
     if (likely(current_uid().val < 10000)) {
@@ -132,7 +132,7 @@ out:
     return length;
 }
 
-static ssize_t my_write_access(struct file *file, char *buf, size_t size)
+static ssize_t __nocfi my_write_access(struct file *file, char *buf, size_t size)
 {
     // apply to all app uids
     if (likely(current_uid().val < 10000)) {
@@ -367,7 +367,7 @@ out:
 typedef int (*sel_open_handle_status_fn)(struct inode *inode, struct file *filp);
 static sel_open_handle_status_fn orig_sel_open_handle_status, *sel_open_handle_status_slot;
 static sel_open_handle_status_fn callthru_sel_open_handle_status;
-static int my_sel_open_handle_status(struct inode *inode, struct file *filp)
+static int __nocfi my_sel_open_handle_status(struct inode *inode, struct file *filp)
 {
     if (likely(current_uid().val >= 10000 && ksu_selinux_hide_enabled)) {
         void *data;
