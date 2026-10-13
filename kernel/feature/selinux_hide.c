@@ -417,37 +417,38 @@ static int ksu_selinux_hide_enable()
     pr_info("selinux_hide: context_write: 0x%lx [%pSb]\n", (unsigned long)*context_write, *context_write);
     write_op_fn my = my_write_context;
     orig_context_write = *context_write;
+    if (!static_branch_unlikely(&ksu_rkp_key))
+        callthru_context_write = orig_context_write;
     ret = ksu_patch_text(context_write, &my, sizeof(my), KSU_PATCH_TEXT_FLUSH_DCACHE);
     if (ret) {
         pr_err("selinux_hide: init: patch_text context_write err: %d\n", ret);
         goto unhook;
     }
+    if (static_branch_unlikely(&ksu_rkp_key))
+        callthru_context_write = (write_op_fn)ksu_rkp_get_stub(orig_context_write);
 
     access_write = &selinux_write_op[SEL_ACCESS];
     pr_info("selinux_hide: access_write: 0x%lx [%pSb]\n", (unsigned long)*access_write, *access_write);
     my = my_write_access;
     orig_access_write = *access_write;
+    if (!static_branch_unlikely(&ksu_rkp_key))
+        callthru_access_write = orig_access_write;
     ret = ksu_patch_text(access_write, &my, sizeof(my), KSU_PATCH_TEXT_FLUSH_DCACHE);
     if (ret) {
         pr_err("selinux_hide: init: patch_text access_write err: %d\n", ret);
         goto unhook;
     }
+    if (static_branch_unlikely(&ksu_rkp_key))
+        callthru_access_write = (write_op_fn)ksu_rkp_get_stub(orig_access_write);
 
     ret = ksu_lsm_hook(&selinux_setprocattr_hook);
     if (ret) {
         pr_err("selinux_hide: init: selinux_setprocattr_hook err: %d\n", ret);
         goto unhook;
     }
-
-    if (static_branch_unlikely(&ksu_rkp_key)) {
-        callthru_context_write = (write_op_fn)ksu_rkp_get_stub(orig_context_write);
-        callthru_access_write = (write_op_fn)ksu_rkp_get_stub(orig_access_write);
-        callthru_setprocattr = (setprocattr_fn)ksu_rkp_get_stub(selinux_setprocattr_hook.original);
-    } else {
-        callthru_context_write = orig_context_write;
-        callthru_access_write = orig_access_write;
-        callthru_setprocattr = (setprocattr_fn)selinux_setprocattr_hook.original;
-    }
+    callthru_setprocattr = static_branch_unlikely(&ksu_rkp_key) ?
+                               (setprocattr_fn)ksu_rkp_get_stub(selinux_setprocattr_hook.original) :
+                               (setprocattr_fn)selinux_setprocattr_hook.original;
 
     return 0;
 
