@@ -62,11 +62,6 @@ static void __nocfi kdp_commit_worker(struct work_struct *work)
     struct cred *ro_cred;
     bool user_changed;
 
-    if (!uid_eq(current_euid(), GLOBAL_ROOT_UID)) {
-        cw->result = -EPERM;
-        goto out;
-    }
-
     target_cred = rcu_access_pointer(cw->target->cred);
     target_real_cred = rcu_access_pointer(cw->target->real_cred);
     if (target_cred != old_cred || target_real_cred != old_cred) {
