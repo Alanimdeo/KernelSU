@@ -127,6 +127,7 @@ int ksu_rkp_branch_patch(void *dst, void *src)
         set_memory_rox((unsigned long)ksu_stub_page, 1);
 #else
         set_memory_ro((unsigned long)ksu_stub_page, 1);
+        set_memory_x((unsigned long)ksu_stub_page, 1);
 #endif
     }
 
