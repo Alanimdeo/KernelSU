@@ -35,15 +35,19 @@ void rkp_jb_init(void)
 
 struct ksu_branch_site {
     void *fn_addr;
-    u32 displaced_insn;
+    u32 insn_at_patch; /* insn at fn+preamble_skip*4, overwritten with B new_fn */
+    u32 insn_at_fn0; /* insn at fn+0 when replaced with BTI C; 0 if not replaced */
     int stub_idx;
     int preamble_skip;
 };
 
 #define KSU_MAX_BRANCH_SITES 16
-/* Stub layout: [kcfi_hash][displaced_insn][B fn+N][pad]
- * Callable entry is stub+4; KCFI reads (entry-4) = stub[0] = kcfi_hash.
- * N = (preamble_skip + 1) * 4, i.e. resume after the patched branch. */
+/*
+ * Stub layout (16 bytes, callable entry at stub+4):
+ *   [kcfi_hash][landing_pad][insn_at_patch][B fn+resume]
+ *   landing_pad = insn_at_fn0 (PAC insn, signs LR) when PAC was replaced,
+ *                 BTI C otherwise (valid BLR target; NOP when BTI not enforced).
+ */
 #define KSU_STUB_SIZE 16
 
 static struct ksu_branch_site ksu_sites[KSU_MAX_BRANCH_SITES];
@@ -61,18 +65,18 @@ static u32 ksu_encode_b(void *from, void *to)
     return 0x14000000u | (u32)(imm26 & 0x3FFFFFFu);
 }
 
+/* PACIASP/PACIBSP sign LR in place.  If left at fn+0 before branching to a new
+ * function that also has PACXSP, LR gets double-signed and AUTXSP at the new
+ * function's epilogue fails with an FPAC fatal exception. */
+static bool ksu_insn_is_pac_signing(u32 insn)
+{
+    return insn == 0xD503233F || insn == 0xD503237F;
+}
+
 static bool ksu_insn_is_bti_landing_pad(u32 insn)
 {
     /* BTI variants: bits[31:8]=0xD50324, bit5=0 (op2 even), bits[4:0]=0x1F */
-    if ((insn & 0xFFFFFF3F) == 0xD503241F)
-        return true;
-    /* PACIASP */
-    if (insn == 0xD503233F)
-        return true;
-    /* PACIBSP */
-    if (insn == 0xD503237F)
-        return true;
-    return false;
+    return (insn & 0xFFFFFF3F) == 0xD503241F || ksu_insn_is_pac_signing(insn);
 }
 
 static bool ksu_insn_is_pc_relative(u32 insn)
@@ -99,10 +103,9 @@ int ksu_rkp_branch_patch(void *dst, void *src)
 {
     void *current_fn, *new_fn;
     struct ksu_branch_site *site;
-    u32 displaced_insn, branch_b;
+    u32 insn_at_patch, branch_b;
     int ret, stub_idx;
     void *stub;
-    u32 stub_insns[2];
 
     current_fn = *(void **)dst;
     new_fn = *(void **)src;
@@ -111,14 +114,23 @@ int ksu_rkp_branch_patch(void *dst, void *src)
 
     site = ksu_find_site(current_fn);
     if (site) {
-        /* Restore: write back the displaced instruction at the patched offset. */
+        /* Restore branch site: displaced instruction first, then fn+0 if replaced. */
         void *restore_addr = (u8 *)current_fn + site->preamble_skip * 4;
-        displaced_insn = site->displaced_insn;
-        ret = aarch64_insn_patch_text(&restore_addr, &displaced_insn, 1);
+        insn_at_patch = site->insn_at_patch;
+        ret = aarch64_insn_patch_text(&restore_addr, &insn_at_patch, 1);
         if (ret) {
             mutex_unlock(&ksu_site_lock);
             pr_err("ksu: branch site restore failed at %pS: %d\n", current_fn, ret);
             return ret;
+        }
+        if (site->insn_at_fn0) {
+            u32 insn_fn0 = site->insn_at_fn0;
+            ret = aarch64_insn_patch_text(&current_fn, &insn_fn0, 1);
+            if (ret) {
+                mutex_unlock(&ksu_site_lock);
+                pr_err("ksu: branch site fn+0 restore failed at %pS: %d\n", current_fn, ret);
+                return ret;
+            }
         }
         *site = ksu_sites[--ksu_site_count];
         pr_info("ksu: branch site removed at %pS\n", current_fn);
@@ -159,24 +171,41 @@ int ksu_rkp_branch_patch(void *dst, void *src)
         return -ENOMEM;
     }
 
-    displaced_insn = *(u32 *)current_fn;
+    u32 fn0_insn = *(u32 *)current_fn;
+    insn_at_patch = fn0_insn;
 
-    /* Advance past any BTI/PAC preamble instructions (up to 2) so we patch
-     * real code and don't clobber the BTI landing pad.  Indirect calls from
-     * the syscall table use BLR and trigger an EL1 BTI violation if fn+0 is
-     * no longer a valid landing pad. */
+    /* Advance past BTI/PAC preamble instructions (up to 2) so we don't
+     * clobber the BTI landing pad at fn+0.  Indirect calls via the syscall
+     * table use BLR; without a valid landing pad at fn+0 the CPU would raise
+     * an EL1 BTI violation. */
     int preamble_skip = 0;
-    while (preamble_skip < 2 && ksu_insn_is_bti_landing_pad(displaced_insn)) {
+    while (preamble_skip < 2 && ksu_insn_is_bti_landing_pad(insn_at_patch)) {
         preamble_skip++;
-        displaced_insn = *(u32 *)((u8 *)current_fn + preamble_skip * 4);
+        insn_at_patch = *(u32 *)((u8 *)current_fn + preamble_skip * 4);
     }
     void *patch_addr = (u8 *)current_fn + preamble_skip * 4;
     void *stub_resume = (u8 *)current_fn + (preamble_skip + 1) * 4;
 
-    if (ksu_insn_is_pc_relative(displaced_insn)) {
+    if (ksu_insn_is_pc_relative(insn_at_patch)) {
         mutex_unlock(&ksu_site_lock);
         pr_err("ksu: %pS: insn at +%d is PC-relative, cannot install\n", current_fn, preamble_skip * 4);
         return -EINVAL;
+    }
+
+    /* PACIASP/PACIBSP at fn+0 cannot simply be left in place: it would sign LR
+     * before the branch to new_fn, and if new_fn also has PACXSP at its entry,
+     * LR gets double-signed and AUTXSP at new_fn's epilogue fails (FPAC panic).
+     * Replace fn+0 with BTI C so the BTI landing pad is preserved without signing. */
+    u32 insn_at_fn0 = 0;
+    if (preamble_skip > 0 && ksu_insn_is_pac_signing(fn0_insn)) {
+        u32 bti_c = 0xD503245F;
+        insn_at_fn0 = fn0_insn;
+        ret = aarch64_insn_patch_text(&current_fn, &bti_c, 1);
+        if (ret) {
+            mutex_unlock(&ksu_site_lock);
+            pr_err("ksu: %pS: fn+0 BTI C replace failed: %d\n", current_fn, ret);
+            return ret;
+        }
     }
 
     branch_b = ksu_encode_b(patch_addr, new_fn);
@@ -189,9 +218,9 @@ int ksu_rkp_branch_patch(void *dst, void *src)
     stub_idx = ksu_stub_next++;
     stub = ksu_stub_page + stub_idx * KSU_STUB_SIZE;
 
-    stub_insns[0] = displaced_insn;
-    stub_insns[1] = ksu_encode_b(stub + 8, stub_resume);
-    if (!stub_insns[1]) {
+    u32 stub_landing_pad = insn_at_fn0 ? insn_at_fn0 : 0xD503245F;
+    u32 b_resume = ksu_encode_b(stub + 12, stub_resume);
+    if (!b_resume) {
         ksu_stub_next--;
         mutex_unlock(&ksu_site_lock);
         pr_err("ksu: stub → fn resume branch out of range\n");
@@ -200,9 +229,10 @@ int ksu_rkp_branch_patch(void *dst, void *src)
 
     /* Stub page is RO+X; write each word via fixmap (same path as kprobes).
      * KCFI hash is copied from current_fn-4 so indirect callers pass the check. */
-    aarch64_insn_write((u8 *)stub + 0, *(u32 *)((u8 *)current_fn - 4)); /* KCFI hash */
-    aarch64_insn_write((u8 *)stub + 4, stub_insns[0]); /* displaced insn */
-    aarch64_insn_write((u8 *)stub + 8, stub_insns[1]); /* B fn resume */
+    aarch64_insn_write((u8 *)stub + 0, *(u32 *)((u8 *)current_fn - 4));
+    aarch64_insn_write((u8 *)stub + 4, stub_landing_pad);
+    aarch64_insn_write((u8 *)stub + 8, insn_at_patch);
+    aarch64_insn_write((u8 *)stub + 12, b_resume);
 
     ret = aarch64_insn_patch_text(&patch_addr, &branch_b, 1);
     if (ret) {
@@ -213,7 +243,8 @@ int ksu_rkp_branch_patch(void *dst, void *src)
 
     ksu_sites[ksu_site_count++] = (struct ksu_branch_site){
         .fn_addr = current_fn,
-        .displaced_insn = displaced_insn,
+        .insn_at_patch = insn_at_patch,
+        .insn_at_fn0 = insn_at_fn0,
         .stub_idx = stub_idx,
         .preamble_skip = preamble_skip,
     };
