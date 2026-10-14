@@ -37,11 +37,13 @@ struct ksu_branch_site {
     void *fn_addr;
     u32 displaced_insn;
     int stub_idx;
+    int preamble_skip;
 };
 
 #define KSU_MAX_BRANCH_SITES 16
-/* Stub layout: [kcfi_hash][displaced_insn][B fn+4][pad]
- * Callable entry is stub+4; KCFI reads (entry-4) = stub[0] = kcfi_hash. */
+/* Stub layout: [kcfi_hash][displaced_insn][B fn+N][pad]
+ * Callable entry is stub+4; KCFI reads (entry-4) = stub[0] = kcfi_hash.
+ * N = (preamble_skip + 1) * 4, i.e. resume after the patched branch. */
 #define KSU_STUB_SIZE 16
 
 static struct ksu_branch_site ksu_sites[KSU_MAX_BRANCH_SITES];
@@ -57,6 +59,20 @@ static u32 ksu_encode_b(void *from, void *to)
     if (imm26 < -(1 << 25) || imm26 > (1 << 25) - 1)
         return 0;
     return 0x14000000u | (u32)(imm26 & 0x3FFFFFFu);
+}
+
+static bool ksu_insn_is_bti_landing_pad(u32 insn)
+{
+    /* BTI variants: bits[31:8]=0xD50324, bit5=0 (op2 even), bits[4:0]=0x1F */
+    if ((insn & 0xFFFFFF3F) == 0xD503241F)
+        return true;
+    /* PACIASP */
+    if (insn == 0xD503233F)
+        return true;
+    /* PACIBSP */
+    if (insn == 0xD503237F)
+        return true;
+    return false;
 }
 
 static bool ksu_insn_is_pc_relative(u32 insn)
@@ -95,9 +111,10 @@ int ksu_rkp_branch_patch(void *dst, void *src)
 
     site = ksu_find_site(current_fn);
     if (site) {
-        /* Restore: write back the displaced instruction. */
+        /* Restore: write back the displaced instruction at the patched offset. */
+        void *restore_addr = (u8 *)current_fn + site->preamble_skip * 4;
         displaced_insn = site->displaced_insn;
-        ret = aarch64_insn_patch_text(&current_fn, &displaced_insn, 1);
+        ret = aarch64_insn_patch_text(&restore_addr, &displaced_insn, 1);
         if (ret) {
             mutex_unlock(&ksu_site_lock);
             pr_err("ksu: branch site restore failed at %pS: %d\n", current_fn, ret);
@@ -143,16 +160,29 @@ int ksu_rkp_branch_patch(void *dst, void *src)
     }
 
     displaced_insn = *(u32 *)current_fn;
+
+    /* Advance past any BTI/PAC preamble instructions (up to 2) so we patch
+     * real code and don't clobber the BTI landing pad.  Indirect calls from
+     * the syscall table use BLR and trigger an EL1 BTI violation if fn+0 is
+     * no longer a valid landing pad. */
+    int preamble_skip = 0;
+    while (preamble_skip < 2 && ksu_insn_is_bti_landing_pad(displaced_insn)) {
+        preamble_skip++;
+        displaced_insn = *(u32 *)((u8 *)current_fn + preamble_skip * 4);
+    }
+    void *patch_addr = (u8 *)current_fn + preamble_skip * 4;
+    void *stub_resume = (u8 *)current_fn + (preamble_skip + 1) * 4;
+
     if (ksu_insn_is_pc_relative(displaced_insn)) {
         mutex_unlock(&ksu_site_lock);
-        pr_err("ksu: %pS: first insn is PC-relative, cannot install\n", current_fn);
+        pr_err("ksu: %pS: insn at +%d is PC-relative, cannot install\n", current_fn, preamble_skip * 4);
         return -EINVAL;
     }
 
-    branch_b = ksu_encode_b(current_fn, new_fn);
+    branch_b = ksu_encode_b(patch_addr, new_fn);
     if (!branch_b) {
         mutex_unlock(&ksu_site_lock);
-        pr_err("ksu: %p → %p branch out of ±128MB range\n", current_fn, new_fn);
+        pr_err("ksu: %p → %p branch out of ±128MB range\n", patch_addr, new_fn);
         return -ERANGE;
     }
 
@@ -160,11 +190,11 @@ int ksu_rkp_branch_patch(void *dst, void *src)
     stub = ksu_stub_page + stub_idx * KSU_STUB_SIZE;
 
     stub_insns[0] = displaced_insn;
-    stub_insns[1] = ksu_encode_b(stub + 8, (void *)((unsigned long)current_fn + 4));
+    stub_insns[1] = ksu_encode_b(stub + 8, stub_resume);
     if (!stub_insns[1]) {
         ksu_stub_next--;
         mutex_unlock(&ksu_site_lock);
-        pr_err("ksu: stub → fn+4 branch out of range\n");
+        pr_err("ksu: stub → fn resume branch out of range\n");
         return -ERANGE;
     }
 
@@ -172,9 +202,9 @@ int ksu_rkp_branch_patch(void *dst, void *src)
      * KCFI hash is copied from current_fn-4 so indirect callers pass the check. */
     aarch64_insn_write((u8 *)stub + 0, *(u32 *)((u8 *)current_fn - 4)); /* KCFI hash */
     aarch64_insn_write((u8 *)stub + 4, stub_insns[0]); /* displaced insn */
-    aarch64_insn_write((u8 *)stub + 8, stub_insns[1]); /* B fn+4 */
+    aarch64_insn_write((u8 *)stub + 8, stub_insns[1]); /* B fn resume */
 
-    ret = aarch64_insn_patch_text(&current_fn, &branch_b, 1);
+    ret = aarch64_insn_patch_text(&patch_addr, &branch_b, 1);
     if (ret) {
         ksu_stub_next--;
         mutex_unlock(&ksu_site_lock);
@@ -185,6 +215,7 @@ int ksu_rkp_branch_patch(void *dst, void *src)
         .fn_addr = current_fn,
         .displaced_insn = displaced_insn,
         .stub_idx = stub_idx,
+        .preamble_skip = preamble_skip,
     };
     pr_info("ksu: branch site installed: %pS → %pS (stub[%d])\n", current_fn, new_fn, stub_idx);
 
