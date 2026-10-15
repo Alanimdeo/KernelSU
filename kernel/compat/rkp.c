@@ -197,21 +197,13 @@ int ksu_rkp_branch_patch(void *dst, void *src)
      * LR gets double-signed and AUTXSP at new_fn's epilogue fails (FPAC panic).
      * Replace fn+0 with BTI C so the BTI landing pad is preserved without signing. */
     u32 insn_at_fn0 = 0;
-    if (preamble_skip > 0 && ksu_insn_is_pac_signing(fn0_insn)) {
-        u32 bti_c = 0xD503245F;
+    if (preamble_skip > 0 && ksu_insn_is_pac_signing(fn0_insn))
         insn_at_fn0 = fn0_insn;
-        ret = aarch64_insn_patch_text(&current_fn, &bti_c, 1);
-        if (ret) {
-            mutex_unlock(&ksu_site_lock);
-            pr_err("ksu: %pS: fn+0 BTI C replace failed: %d\n", current_fn, ret);
-            return ret;
-        }
-    }
 
     branch_b = ksu_encode_b(patch_addr, new_fn);
     if (!branch_b) {
         mutex_unlock(&ksu_site_lock);
-        pr_err("ksu: %p → %p branch out of ±128MB range\n", patch_addr, new_fn);
+        pr_err("ksu: %pS: branch to %pS out of ±128MB range\n", patch_addr, new_fn);
         return -ERANGE;
     }
 
@@ -223,18 +215,29 @@ int ksu_rkp_branch_patch(void *dst, void *src)
     if (!b_resume) {
         ksu_stub_next--;
         mutex_unlock(&ksu_site_lock);
-        pr_err("ksu: stub → fn resume branch out of range\n");
+        pr_err("ksu: stub → %pS resume branch out of range\n", current_fn);
         return -ERANGE;
     }
 
     /* Stub page is RO+X; write each word via fixmap (same path as kprobes).
-     * KCFI hash is copied from current_fn-4 so indirect callers pass the check. */
+     * KCFI hash is copied from current_fn-4 so indirect callers pass the check.
+     * Stub is not yet reachable, so these writes don't need to be atomic with
+     * the live-function patch below. */
     aarch64_insn_write((u8 *)stub + 0, *(u32 *)((u8 *)current_fn - 4));
     aarch64_insn_write((u8 *)stub + 4, stub_landing_pad);
     aarch64_insn_write((u8 *)stub + 8, insn_at_patch);
     aarch64_insn_write((u8 *)stub + 12, b_resume);
 
-    ret = aarch64_insn_patch_text(&patch_addr, &branch_b, 1);
+    /* Commit fn+0 (BTI C, replacing PAC sign) and fn+preamble_skip (B new_fn)
+     * in a single stop_machine so no CPU ever sees a partial state. */
+    if (insn_at_fn0) {
+        u32 bti_c = 0xD503245F;
+        void *addrs[2] = { current_fn, patch_addr };
+        u32 insns[2] = { bti_c, branch_b };
+        ret = aarch64_insn_patch_text(addrs, insns, 2);
+    } else {
+        ret = aarch64_insn_patch_text(&patch_addr, &branch_b, 1);
+    }
     if (ret) {
         ksu_stub_next--;
         mutex_unlock(&ksu_site_lock);

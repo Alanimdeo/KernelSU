@@ -1,4 +1,4 @@
-#include "hook/patch_memory.h"
+#include "compat/jailbreak.h"
 #include "infra/symbol_resolver.h"
 #include "klog.h"
 
@@ -16,7 +16,7 @@ void defex_jb_init(void)
     if (!defex_enforce_fn)
         return;
 
-    if (ksu_patch_text(&defex_enforce_fn, &new_fn, sizeof(void *), 0)) {
+    if (ksu_rkp_branch_patch(&defex_enforce_fn, &new_fn)) {
         pr_warn("KSU: DEFEX patch failed\n");
         return;
     }
